@@ -16,7 +16,10 @@ module serv_top
     parameter [0:0] DEBUG = 1'b0,
     parameter [0:0] MDU = 1'b0,
     parameter [0:0] COMPRESSED=0,
-    parameter [0:0] ALIGN = COMPRESSED)
+    parameter [0:0] ALIGN = COMPRESSED,
+    /* LINUX=1: A extension (see o_dbus_amo), U-mode, exact CSR decode, fence/wfi as
+       no-ops. Needed to run an M-mode no-MMU Linux kernel. */
+    parameter [0:0] LINUX = 1'b0)
    (
    input wire 		      clk,
    input wire 		      i_rst,
@@ -68,6 +71,12 @@ module serv_top
    output wire [3:0] 	      o_dbus_sel,
    output wire 		      o_dbus_we ,
    output wire 		      o_dbus_cyc,
+   /* LINUX: AMO/LR/SC. The transaction looks like a word store (o_dbus_we=1, sel=1111,
+      o_dbus_dat=rs2, o_dbus_adr=rs1) with o_dbus_amo=1 and o_dbus_amo_op=funct5. The
+      returned i_dbus_rdt is written to rd: the old memory value, or 0/1 for SC. Something
+      outside the core (an AMO unit) must perform the read-modify-write and reservation. */
+   output wire 		      o_dbus_amo,
+   output wire [4:0] 	      o_dbus_amo_op,
    input wire [31:0] 	      i_dbus_rdt,
    input wire 		      i_dbus_ack,
    //Extension
@@ -289,9 +298,12 @@ module serv_top
       .i_rf_ready     (i_rf_ready),
       .o_rf_rd_en     (rd_en));
 
+   wire 	 csr_mip_en;
+
    serv_decode
      #(.PRE_REGISTER (PRE_REGISTER),
-       .MDU(MDU))
+       .MDU(MDU),
+       .LINUX(LINUX))
    decode
      (
       .clk (clk),
@@ -309,6 +321,8 @@ module serv_top
       .o_rd_op            (rd_op),
       .o_sh_right         (sh_right),
       .o_mdu_op           (mdu_op),
+      .o_amo              (o_dbus_amo),
+      .o_amo_op           (o_dbus_amo_op),
       .o_two_stage_op     (two_stage_op),
       //Extension
       .o_ext_funct3       (o_ext_funct3),
@@ -342,6 +356,7 @@ module serv_top
       .o_csr_mstatus_en   (csr_mstatus_en),
       .o_csr_mie_en       (csr_mie_en),
       .o_csr_mcause_en    (csr_mcause_en),
+      .o_csr_mip_en       (csr_mip_en),
       .o_csr_source       (csr_source),
       .o_csr_d_sel        (csr_d_sel),
       .o_csr_imm_en       (csr_imm_en),
@@ -553,7 +568,8 @@ module serv_top
       if (|WITH_CSR) begin : gen_csr
 	 serv_csr
 	   #(.RESET_STRATEGY (RESET_STRATEGY),
-	     .W(W))
+	     .W(W),
+	     .LINUX(LINUX))
 	 csr
 	   (
 	    .i_clk        (clk),
@@ -578,6 +594,7 @@ module serv_top
 	    .i_mstatus_en (csr_mstatus_en),
 	    .i_mie_en     (csr_mie_en    ),
 	    .i_mcause_en  (csr_mcause_en ),
+	    .i_mip_en     (csr_mip_en),
 	    .i_csr_source (csr_source),
 	    .i_mret       (mret),
 	    .i_csr_d_sel  (csr_d_sel),

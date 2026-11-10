@@ -7,7 +7,12 @@
 `default_nettype none
 module serv_decode
   #(parameter [0:0] PRE_REGISTER = 1,
-    parameter [0:0] MDU = 0)
+    parameter [0:0] MDU = 0,
+    /* LINUX=1 adds what an M-mode no-MMU Linux needs (see qerv-linux branch notes):
+       A extension (AMO/LR/SC as one dbus transaction carrying funct5, executed outside the
+       core), exact 12-bit CSR decode (unimplemented CSRs read 0, writes ignored), mip
+       readable, fence/fence.i/wfi as no-ops. LINUX=0 is bit-identical to upstream. */
+    parameter [0:0] LINUX = 0)
   (
    input wire        clk,
    //Input
@@ -26,6 +31,9 @@ module serv_decode
    output reg       o_dbus_en,
    //MDU
    output reg       o_mdu_op,
+   //A extension (LINUX)
+   output reg       o_amo,
+   output reg [4:0] o_amo_op,
    //Extension
    output reg [2:0] o_ext_funct3,
    //To bufreg
@@ -55,6 +63,7 @@ module serv_decode
    output reg       o_csr_mstatus_en,
    output reg       o_csr_mie_en,
    output reg       o_csr_mcause_en,
+   output reg       o_csr_mip_en,
    output reg [1:0] o_csr_source,
    output reg       o_csr_d_sel,
    output reg       o_csr_imm_en,
@@ -70,26 +79,35 @@ module serv_decode
 
    reg [4:0] opcode;
    reg [2:0] funct3;
-   reg        op20;
-   reg        op21;
-   reg        op22;
-   reg        op26;
+   /* Instruction bits 31:20. Upstream only keeps bits 20, 21, 22, 25, 26 and 30; the rest
+      are only used when LINUX=1 (CSR address, AMO funct5) and are optimized away otherwise. */
+   reg [11:0] imm31_20;
+   wire       op20  = imm31_20[0];
+   wire       op21  = imm31_20[1];
+   wire       op22  = imm31_20[2];
+   wire       imm25 = imm31_20[5];
+   wire       op26  = imm31_20[6];
+   wire       imm30 = imm31_20[10];
 
-   reg       imm25;
-   reg       imm30;
+   //A extension: AMO opcode 0101111 (opcode[6:2] = 01011)
+   wire co_amo    = LINUX & (opcode == 5'b01011);
+   wire [4:0] co_amo_op = imm31_20[11:7];
+   //MISC-MEM (fence, fence.i): opcode 0001111. Decoded as a one-stage no-op when LINUX=1
+   //(upstream treats it as a data bus read that does not write rd)
+   wire misc_mem  = LINUX & !opcode[4] & !opcode[3] & !opcode[2] & opcode[0];
 
    wire co_mdu_op     = MDU & (opcode == 5'b01100) & imm25;
 
    wire co_two_stage_op =
-	~opcode[2] | (funct3[0] & ~funct3[1] & ~opcode[0] & ~opcode[4]) |
+	(~opcode[2] & !misc_mem) | (funct3[0] & ~funct3[1] & ~opcode[0] & ~opcode[4]) |
 	(funct3[1] & ~funct3[2] & ~opcode[0] & ~opcode[4]) | co_mdu_op;
    wire co_shift_op = (opcode[2] & ~funct3[1]) & !co_mdu_op;
    wire co_branch_op = opcode[4];
-   wire co_dbus_en    = ~opcode[2] & ~opcode[4];
+   wire co_dbus_en    = ~opcode[2] & ~opcode[4] & !misc_mem;
    wire co_mtval_pc   = opcode[4];
    wire co_mem_word   = funct3[1];
    wire co_rd_alu_en  = !opcode[0] & opcode[2] & !opcode[4] & !co_mdu_op;
-   wire co_rd_mem_en  = (!opcode[2] & !opcode[0]) | co_mdu_op;
+   wire co_rd_mem_en  = (!opcode[2] & !opcode[0]) | co_mdu_op | co_amo;
    wire [2:0] co_ext_funct3 = funct3;
 
    //jal,branch =     imm
@@ -97,7 +115,8 @@ module serv_decode
    //mem        = rs1+imm
    //shift      = rs1
    wire co_bufreg_rs1_en = !opcode[4] | (!opcode[1] & opcode[0]);
-   wire co_bufreg_imm_en = !opcode[2];
+   //AMO addresses are rs1 without an immediate
+   wire co_bufreg_imm_en = !opcode[2] & !co_amo;
 
    //Clear LSB of immediate for BRANCH and JAL ops
    //True for BRANCH and JAL
@@ -124,7 +143,8 @@ module serv_decode
    //False for STORE, BRANCH, MISC-MEM
    wire co_rd_op = (opcode[2] |
                      (!opcode[2] & opcode[4] & opcode[0]) |
-                     (!opcode[2] & !opcode[3] & !opcode[0]));
+                     (!opcode[2] & !opcode[3] & !opcode[0]) |
+                     co_amo);
 
    //
    //funct3
@@ -145,8 +165,9 @@ module serv_decode
 
    wire co_ctrl_mret = opcode[4] & opcode[2] & op21 & !(|funct3);
    //Matches system opcodes except CSR accesses (funct3 == 0)
-   //and mret (!op21)
-   wire co_e_op = opcode[4] & opcode[2] & !op21 & !(|funct3);
+   //and mret (!op21). With LINUX, wfi (0x105, the only one with bit 22 set) is excluded and
+   //executes as a no-op instead of trapping like ebreak.
+   wire co_e_op = opcode[4] & opcode[2] & !op21 & !(|funct3) & !(LINUX & op22);
 
    //opcode & funct3 & imm30
 
@@ -185,16 +206,32 @@ module serv_decode
 
     */
 
+   /*
+    With LINUX, the full 12-bit address is matched so that every other CSR (mhartid, misa,
+    pmpaddr0/pmpcfg0, counters, ...) reads as 0 and ignores writes, instead of aliasing one
+    of the implemented ones. mip (0x344) is added, read-only.
+    */
+   wire csr_is_mstatus  = imm31_20 == 12'h300;
+   wire csr_is_mie      = imm31_20 == 12'h304;
+   wire csr_is_mtvec    = imm31_20 == 12'h305;
+   wire csr_is_mscratch = imm31_20 == 12'h340;
+   wire csr_is_mepc     = imm31_20 == 12'h341;
+   wire csr_is_mcause   = imm31_20 == 12'h342;
+   wire csr_is_mtval    = imm31_20 == 12'h343;
+   wire csr_is_mip      = imm31_20 == 12'h344;
+
    //true  for mtvec,mscratch,mepc and mtval
    //false for mstatus, mie, mcause
-   wire csr_valid = op20 | (op26 & !op21);
+   wire csr_valid = LINUX ? (csr_is_mtvec | csr_is_mscratch | csr_is_mepc | csr_is_mtval) :
+                    (op20 | (op26 & !op21));
 
    wire co_rd_csr_en = csr_op;
 
    wire co_csr_en         = csr_op & csr_valid;
-   wire co_csr_mstatus_en = csr_op & !op26 & !op22 & !op20;
-   wire co_csr_mie_en     = csr_op & !op26 &  op22 & !op20;
-   wire co_csr_mcause_en  = csr_op         &  op21 & !op20;
+   wire co_csr_mstatus_en = csr_op & (LINUX ? csr_is_mstatus : (!op26 & !op22 & !op20));
+   wire co_csr_mie_en     = csr_op & (LINUX ? csr_is_mie     : (!op26 &  op22 & !op20));
+   wire co_csr_mcause_en  = csr_op & (LINUX ? csr_is_mcause  : (         op21 & !op20));
+   wire co_csr_mip_en     = csr_op & LINUX & csr_is_mip;
 
    wire [1:0] co_csr_source = funct3[1:0];
    wire co_csr_d_sel = funct3[2];
@@ -223,8 +260,9 @@ module serv_decode
 
    wire [3:0] co_immdec_en;
    assign co_immdec_en[3] = opcode[4] | opcode[3] | opcode[2] | !opcode[0];                 //B I J S U
-   assign co_immdec_en[2] = (opcode[4] & opcode[2]) | !opcode[3] | opcode[0];               //  I J   U
-   assign co_immdec_en[1] = (opcode[2:1] == 2'b01) | (opcode[2] & opcode[0]) | co_csr_imm_en;//    J   U
+   //AMO (R-type) keeps rs1/rs2 like OP; with W=1 these registers double as rs1/rs2 addresses
+   assign co_immdec_en[2] = ((opcode[4] & opcode[2]) | !opcode[3] | opcode[0]) & !co_amo;    //  I J   U
+   assign co_immdec_en[1] = ((opcode[2:1] == 2'b01) | (opcode[2] & opcode[0]) | co_csr_imm_en) & !co_amo;//    J   U
    assign co_immdec_en[0] = ~co_rd_op;                                                       //B     S
 
    wire [2:0] co_alu_rd_sel;
@@ -241,14 +279,9 @@ module serv_decode
 
          always @(posedge clk) begin
             if (i_wb_en) begin
-               funct3 <= i_wb_rdt[14:12];
-               imm30  <= i_wb_rdt[30];
-               imm25  <= i_wb_rdt[25];
-               opcode <= i_wb_rdt[6:2];
-               op20   <= i_wb_rdt[20];
-               op21   <= i_wb_rdt[21];
-               op22   <= i_wb_rdt[22];
-               op26   <= i_wb_rdt[26];
+               funct3   <= i_wb_rdt[14:12];
+               opcode   <= i_wb_rdt[6:2];
+               imm31_20 <= i_wb_rdt[31:20];
             end
          end
 
@@ -265,6 +298,8 @@ module serv_decode
             o_shift_op         = co_shift_op;
             o_rd_op            = co_rd_op;
             o_mdu_op           = co_mdu_op;
+            o_amo              = co_amo;
+            o_amo_op           = co_amo_op;
             o_ext_funct3       = co_ext_funct3;
             o_bufreg_rs1_en    = co_bufreg_rs1_en;
             o_bufreg_imm_en    = co_bufreg_imm_en;
@@ -288,6 +323,7 @@ module serv_decode
             o_csr_mstatus_en   = co_csr_mstatus_en;
             o_csr_mie_en       = co_csr_mie_en;
             o_csr_mcause_en    = co_csr_mcause_en;
+            o_csr_mip_en       = co_csr_mip_en;
             o_csr_source       = co_csr_source;
             o_csr_d_sel        = co_csr_d_sel;
             o_csr_imm_en       = co_csr_imm_en;
@@ -302,14 +338,9 @@ module serv_decode
       end else begin : gen_post_register
 
          always @(*) begin
-            funct3  = i_wb_rdt[14:12];
-            imm30   = i_wb_rdt[30];
-            imm25   = i_wb_rdt[25];
-            opcode  = i_wb_rdt[6:2];
-            op20    = i_wb_rdt[20];
-            op21    = i_wb_rdt[21];
-            op22    = i_wb_rdt[22];
-            op26    = i_wb_rdt[26];
+            funct3   = i_wb_rdt[14:12];
+            opcode   = i_wb_rdt[6:2];
+            imm31_20 = i_wb_rdt[31:20];
          end
 
          always @(posedge clk) begin
@@ -326,6 +357,8 @@ module serv_decode
                o_shift_op         <= co_shift_op;
                o_rd_op            <= co_rd_op;
                o_mdu_op           <= co_mdu_op;
+               o_amo              <= co_amo;
+               o_amo_op           <= co_amo_op;
                o_ext_funct3       <= co_ext_funct3;
                o_bufreg_rs1_en    <= co_bufreg_rs1_en;
                o_bufreg_imm_en    <= co_bufreg_imm_en;
@@ -349,6 +382,7 @@ module serv_decode
                o_csr_mstatus_en   <= co_csr_mstatus_en;
                o_csr_mie_en       <= co_csr_mie_en;
                o_csr_mcause_en    <= co_csr_mcause_en;
+               o_csr_mip_en       <= co_csr_mip_en;
                o_csr_source       <= co_csr_source;
                o_csr_d_sel        <= co_csr_d_sel;
                o_csr_imm_en       <= co_csr_imm_en;

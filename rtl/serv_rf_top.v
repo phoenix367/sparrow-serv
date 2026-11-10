@@ -35,6 +35,8 @@ module serv_rf_top
     parameter RESET_STRATEGY = "MINI",
     parameter [0:0] DEBUG = 1'b0,
     parameter WITH_CSR = 1,
+    /* LINUX=1: A extension, U-mode, exact CSR decode, fence/wfi as no-ops (serv_top) */
+    parameter [0:0] LINUX = 1'b0,
     parameter W        = 1,
     parameter RF_WIDTH = W * 2,
 	parameter RF_L2D   = $clog2((32+(WITH_CSR*4))*32/RF_WIDTH))
@@ -74,6 +76,8 @@ module serv_rf_top
    output wire [3:0]  o_dbus_sel,
    output wire 	      o_dbus_we ,
    output wire 	      o_dbus_cyc,
+   output wire 	      o_dbus_amo,
+   output wire [4:0]  o_dbus_amo_op,
    input wire [31:0]  i_dbus_rdt,
    input wire 	      i_dbus_ack,
 
@@ -156,6 +160,7 @@ module serv_rf_top
        .WITH_CSR (WITH_CSR),
        .DEBUG (DEBUG),
        .MDU(MDU),
+       .LINUX(LINUX),
        .COMPRESSED(COMPRESSED),
        .ALIGN(ALIGN),
        .W(W))
@@ -211,6 +216,8 @@ module serv_rf_top
       .o_dbus_sel   (o_dbus_sel),
       .o_dbus_we    (o_dbus_we),
       .o_dbus_cyc   (o_dbus_cyc),
+      .o_dbus_amo   (o_dbus_amo),
+      .o_dbus_amo_op(o_dbus_amo_op),
       .i_dbus_rdt   (i_dbus_rdt),
       .i_dbus_ack   (i_dbus_ack),
 
