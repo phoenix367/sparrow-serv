@@ -65,6 +65,7 @@ module serv_state
    output wire 	     o_dbus_cyc,
    input wire 	     i_dbus_ack,
    output wire 	     o_ibus_cyc,
+   output wire 	     o_ibus_sel,
    input wire 	     i_ibus_ack,
    //RF Interface
    output wire 	     o_rf_rreq,
@@ -148,6 +149,10 @@ module serv_state
    assign o_bufreg_en = (o_cnt_en & (o_init | ((o_ctrl_trap | i_branch_op) & i_two_stage_op))) | (i_shift_op & init_done & (i_sh_right | i_sh_done));
 
    assign o_ibus_cyc = ibus_cyc & !i_rst;
+   //ibus_cyc without the reset gating: the bus is the fetch's whenever o_ibus_cyc is set
+   //(and also during reset). For selecting between the ibus and dbus addresses without the
+   //reset net in that path (qerv_cpu's MMU).
+   assign o_ibus_sel = ibus_cyc;
 
    assign o_init = i_two_stage_op & !i_new_irq & !init_done;
 

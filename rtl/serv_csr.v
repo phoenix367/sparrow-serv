@@ -31,6 +31,7 @@ module serv_csr
    input wire 	    i_cnt_done,
    input wire 	    i_mem_op,
    input wire 	    i_mtip,
+   input wire 	    i_seip,         //SMODE: supervisor external interrupt (PLIC), level
    input wire 	    i_trap,
    output reg 	    o_new_irq,
    //Control
@@ -66,6 +67,7 @@ module serv_csr
    output wire       o_sum,
    output wire       o_mxr,
    output wire       o_satp_mode,
+   output wire       o_xlate,        //SMODE: satp.MODE & priv < M, as a register
    output wire [19:0] o_satp_ppn);
 
    localparam [1:0]
@@ -159,6 +161,7 @@ module serv_csr
    assign o_sum = 1'b0;
    assign o_mxr = 1'b0;
    assign o_satp_mode = 1'b0;
+   assign o_xlate = 1'b0;
    assign o_satp_ppn = 20'd0;
 
    always @(posedge i_clk) begin
@@ -255,10 +258,11 @@ module serv_csr
       0 mstatus 0x300: SIE 1, MIE 3, SPIE 5, MPIE 7, SPP 8, MPP 12:11, SUM 18, MXR 19
                        (MPP = 10 is stored as 11)
       1 sstatus 0x100: SIE, SPIE, SPP, SUM, MXR
-      2 mie   0x304: STIE 5, MTIE 7        3 sie 0x104: STIE (if delegated)
-      4 mip   0x344: STIP 5 (writable), MTIP 7 (CLINT)   5 sip 0x144: STIP (read-only)
+      2 mie   0x304: STIE 5, MTIE 7, SEIE 9     3 sie 0x104: STIE, SEIE (if delegated)
+      4 mip   0x344: STIP 5 (writable), MTIP 7 (CLINT), SEIP 9 (i_seip, read-only)
+      5 sip 0x144: STIP, SEIP (read-only, if delegated)
       6 mcause 0x342, 7 scause 0x142: bit 31 and bits 3:0
-      8 medeleg 0x302: bits 0,3,4,6,8,12,13,15     9 mideleg 0x303: bit 5 (STI)
+      8 medeleg 0x302: bits 0,3,4,6,8,12,13,15     9 mideleg 0x303: bits 5 (STI), 9 (SEI)
       10 satp 0x180: MODE 31, PPN 19:0 (ASID reads 0: no ASIDs)
       11 time 0xC01, 12 timeh 0xC81: i_mtime, sampled at every fetch so that a read that
          takes several cycles is not torn by a carry
@@ -267,7 +271,7 @@ module serv_csr
     Every CSR is a parallel 32-bit view; at[i] marks the cycle in which bit i is on the
     serial CSR bus (lane i%W). Synthesis keeps only the bits that are not constant.
 
-    Traps: interrupts are level-sensitive (MTI before STI) and sampled at each fetch; an
+    Traps: interrupts are level-sensitive (MTI, then SEI, then STI) and sampled at each fetch; an
     instruction page fault with the fetch is taken the same way (the fetched word is
     replaced by a trap, tval = pc). A data page fault comes from serv_state (i_dfault).
     The trap goes to S when the hart is below M and the cause is delegated.
@@ -281,14 +285,14 @@ module serv_csr
 
    reg [1:0]  priv;
    reg 	      m_ie, m_pie, mpp1, mpp0, s_ie, s_pie, s_pp, sum, mxr;
-   reg 	      mtie, stie, stip, mideleg5;
+   reg 	      mtie, stie, stip, mideleg5, seie, mideleg9;
    reg [15:0] medeleg;
    reg 	      m_int, s_int;
    reg [3:0]  m_code, s_code;
    reg 	      satp_mode;
    reg [19:0] satp_ppn;
    reg [63:0] mtime_s;
-   reg 	      new_int, int_m, new_ifault, dfault_we;
+   reg 	      new_int, int_m, int_e, new_ifault, dfault_we;
 
    wire       s_mstatus = i_sel[0],  s_sstatus = i_sel[1],  s_mie   = i_sel[2];
    wire       s_sie     = i_sel[3],  s_mip     = i_sel[4],  s_sip   = i_sel[5];
@@ -300,14 +304,14 @@ module serv_csr
 
    wire [31:0] v_status  = {12'd0, mxr, sum, 5'd0, mpp1, mpp1 | mpp0, 2'd0, s_pp, m_pie, 1'b0,
 			    s_pie, 1'b0, m_ie, 1'b0, s_ie, 1'b0};
-   wire [31:0] v_mie     = {24'd0, mtie, 1'b0, stie, 5'd0};
-   wire [31:0] v_mip     = {24'd0, i_mtip, 1'b0, stip, 5'd0};
-   wire [31:0] v_sie     = {26'd0, stie & mideleg5, 5'd0};
-   wire [31:0] v_sip     = {26'd0, stip & mideleg5, 5'd0};
+   wire [31:0] v_mie     = {22'd0, seie, 1'b0, mtie, 1'b0, stie, 5'd0};
+   wire [31:0] v_mip     = {22'd0, i_seip, 1'b0, i_mtip, 1'b0, stip, 5'd0};
+   wire [31:0] v_sie     = {22'd0, seie & mideleg9, 3'd0, stie & mideleg5, 5'd0};
+   wire [31:0] v_sip     = {22'd0, i_seip & mideleg9, 3'd0, stip & mideleg5, 5'd0};
    wire [31:0] v_mcause  = {m_int, 27'd0, m_code};
    wire [31:0] v_scause  = {s_int, 27'd0, s_code};
    wire [31:0] v_medeleg = {16'd0, medeleg_m};
-   wire [31:0] v_mideleg = {26'd0, mideleg5, 5'd0};
+   wire [31:0] v_mideleg = {22'd0, mideleg9, 3'd0, mideleg5, 5'd0};
    wire [31:0] v_satp    = {satp_mode, 11'd0, satp_ppn};
 
    wire [31:0] v = ({32{s_mstatus}} & v_status) |
@@ -338,15 +342,17 @@ module serv_csr
    wire [1:0]  cur_priv = i_trap ? tpriv : priv;
    wire        mti = i_mtip & mtie & (!m_mode | m_ie);
    wire        sti = stip & stie & (mideleg5 ? (u_mode | (s_mode & s_ie)) : (!m_mode | m_ie));
-   wire        irq = mti | sti;
+   wire        sei = i_seip & seie & (mideleg9 ? (u_mode | (s_mode & s_ie)) : (!m_mode | m_ie));
+   wire        irq = mti | sei | sti;
 
-   wire [3:0]  code = new_int    ? (int_m ? 4'd7 : 4'd5) :
+   wire [3:0]  code = new_int    ? (int_m ? 4'd7 : int_e ? 4'd9 : 4'd5) :
 		      new_ifault ? 4'd12 :
 		      i_e_op     ? (i_ebreak ? 4'd3 : {2'b10, cur_priv}) :
 		      i_dfault   ? (dfault_we ? 4'd15 : 4'd13) :
 		      i_mem_op   ? (i_mem_cmd ? 4'd6 : 4'd4) :
 		      4'd0;
-   wire        trap_s = !cur_priv[1] & (new_int ? (!int_m & mideleg5) : medeleg_m[code]);
+   wire        trap_s = !cur_priv[1] & (new_int ? (!int_m & (int_e ? mideleg9 : mideleg5)) :
+					    medeleg_m[code]);
 
    wire        sret_done = i_sret & !i_trap & i_cnt_done;
 
@@ -356,6 +362,11 @@ module serv_csr
    assign o_sum       = sum;
    assign o_mxr       = mxr;
    assign o_satp_mode = satp_mode;
+   /* Address translation on (satp.MODE and priv below M), kept as its own register,
+      updated wherever priv or satp.MODE are: the MMU's address selects then start at a
+      flop instead of priv/satp logic. */
+   reg         xlate_r;
+   assign o_xlate     = xlate_r;
    assign o_satp_ppn  = satp_ppn;
 
    integer     k;
@@ -364,6 +375,7 @@ module serv_csr
 	 mtime_s    <= i_mtime;
 	 new_int    <= irq;
 	 int_m      <= mti;
+	 int_e      <= !mti & sei;
 	 new_ifault <= i_ibus_fault & !irq;
 	 o_new_irq  <= irq | i_ibus_fault;
       end
@@ -386,9 +398,14 @@ module serv_csr
       if ((s_mie | (s_sie & mideleg5)) & wr_at[5]) stie <= csr_in[5 % W];
       if (s_mip & wr_at[5])                    stip  <= csr_in[5 % W];
       if (s_mideleg & wr_at[5])                mideleg5 <= csr_in[5 % W];
+      if ((s_mie | (s_sie & mideleg9)) & wr_at[9]) seie <= csr_in[9 % W];
+      if (s_mideleg & wr_at[9])                mideleg9 <= csr_in[9 % W];
       if (s_mcause & wr_at[31])                m_int <= csr_in[31 % W];
       if (s_scause & wr_at[31])                s_int <= csr_in[31 % W];
-      if (s_satp & wr_at[31])                  satp_mode <= csr_in[31 % W];
+      if (s_satp & wr_at[31]) begin
+	 satp_mode <= csr_in[31 % W];
+	 xlate_r   <= csr_in[31 % W] & !priv[1];
+      end
       for (k = 0; k < 4; k = k + 1) begin
 	 if (s_mcause & wr_at[k]) m_code[k] <= csr_in[k % W];
 	 if (s_scause & wr_at[k]) s_code[k] <= csr_in[k % W];
@@ -406,6 +423,7 @@ module serv_csr
 	    s_ie <= 1'b0;
 	    s_pp <= priv[0];
 	    priv <= 2'b01;
+	    xlate_r <= satp_mode;
 	 end else begin
 	    m_int <= new_int;
 	    m_code <= code;
@@ -413,16 +431,19 @@ module serv_csr
 	    m_ie <= 1'b0;
 	    {mpp1, mpp0} <= priv;
 	    priv <= 2'b11;
+	    xlate_r <= 1'b0;
 	 end
       end
       if (mret_done) begin
 	 priv <= {mpp1, mpp1 | mpp0};
+	 xlate_r <= satp_mode & !mpp1;
 	 m_ie <= m_pie;
 	 m_pie <= 1'b1;
 	 {mpp1, mpp0} <= 2'b00;
       end
       if (sret_done) begin
 	 priv <= {1'b0, s_pp};
+	 xlate_r <= satp_mode;
 	 s_ie <= s_pie;
 	 s_pie <= 1'b1;
 	 s_pp <= 1'b0;
@@ -431,12 +452,13 @@ module serv_csr
       if (i_rst) begin
 	 priv <= 2'b11;
 	 {m_ie, m_pie, mpp1, mpp0, s_ie, s_pie, s_pp, sum, mxr} <= 9'd0;
-	 {mtie, stie, stip, mideleg5} <= 4'd0;
+	 {mtie, stie, stip, mideleg5, seie, mideleg9} <= 6'd0;
 	 medeleg <= 16'd0;
 	 {m_int, s_int, m_code, s_code} <= 10'd0;
 	 satp_mode <= 1'b0;
+	 xlate_r <= 1'b0;
 	 satp_ppn <= 20'd0;
-	 {new_int, int_m, new_ifault, dfault_we} <= 4'd0;
+	 {new_int, int_m, int_e, new_ifault, dfault_we} <= 5'd0;
 	 o_new_irq <= 1'b0;
       end
    end

@@ -71,6 +71,7 @@ module serv_rf_top
 `endif
    output wire [31:0] o_ibus_adr,
    output wire 	      o_ibus_cyc,
+   output wire 	      o_ibus_sel,
    input wire [31:0]  i_ibus_rdt,
    input wire 	      i_ibus_ack,
    output wire [31:0] o_dbus_adr,
@@ -93,6 +94,7 @@ module serv_rf_top
    output wire        o_mdu_valid,
    // SMODE: MMU interface (see serv_top)
    input wire [63:0]  i_mtime,
+   input wire         i_seip,
    input wire         i_ibus_fault,
    input wire         i_dbus_fault,
    input wire         i_dbus_fault_we,
@@ -100,6 +102,7 @@ module serv_rf_top
    output wire        o_sum,
    output wire        o_mxr,
    output wire        o_satp_mode,
+   output wire        o_xlate,
    output wire [19:0] o_satp_ppn,
    output wire        o_sfence);
 
@@ -222,6 +225,7 @@ module serv_rf_top
 
       .o_ibus_adr   (o_ibus_adr),
       .o_ibus_cyc   (o_ibus_cyc),
+      .o_ibus_sel   (o_ibus_sel),
       .i_ibus_rdt   (i_ibus_rdt),
       .i_ibus_ack   (i_ibus_ack),
 
@@ -245,6 +249,7 @@ module serv_rf_top
       .o_mdu_valid  (o_mdu_valid),
       //SMODE
       .i_mtime        (i_mtime),
+      .i_seip         (i_seip),
       .i_ibus_fault   (i_ibus_fault),
       .i_dbus_fault   (i_dbus_fault),
       .i_dbus_fault_we(i_dbus_fault_we),
@@ -252,6 +257,7 @@ module serv_rf_top
       .o_sum          (o_sum),
       .o_mxr          (o_mxr),
       .o_satp_mode    (o_satp_mode),
+      .o_xlate        (o_xlate),
       .o_satp_ppn     (o_satp_ppn),
       .o_sfence       (o_sfence));
 

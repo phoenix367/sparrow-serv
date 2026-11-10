@@ -68,6 +68,7 @@ module serv_top
 
    output wire [31:0] 	      o_ibus_adr,
    output wire 		      o_ibus_cyc,
+   output wire 		      o_ibus_sel,       //o_ibus_cyc without reset gating (address select)
    input wire [31:0] 	      i_ibus_rdt,
    input wire 		      i_ibus_ack,
    output wire [31:0] 	      o_dbus_adr,
@@ -93,6 +94,7 @@ module serv_top
    output wire        o_mdu_valid,
    //SMODE: MMU interface
    input wire [63:0]  i_mtime,
+   input wire         i_seip,           //supervisor external interrupt (PLIC), level
    input wire         i_ibus_fault,     //with i_ibus_ack: instruction page fault
    input wire         i_dbus_fault,     //with i_dbus_ack: load/store/AMO page fault
    input wire         i_dbus_fault_we,  //with i_dbus_fault: it was a store/AMO fault
@@ -100,6 +102,7 @@ module serv_top
    output wire        o_sum,
    output wire        o_mxr,
    output wire        o_satp_mode,
+   output wire        o_xlate,
    output wire [19:0] o_satp_ppn,
    output wire        o_sfence);       //one cycle per executed sfence.vma
 
@@ -219,6 +222,7 @@ module serv_top
 
    wire [31:0] wb_ibus_adr;
    wire        wb_ibus_cyc;
+   wire        wb_ibus_sel;
    wire [31:0] wb_ibus_rdt;
    wire        wb_ibus_ack;
 
@@ -238,9 +242,11 @@ module serv_top
             .o_wb_ibus_cyc(o_ibus_cyc),
             .i_wb_ibus_rdt(i_ibus_rdt),
             .i_wb_ibus_ack(i_ibus_ack));
+         assign o_ibus_sel = o_ibus_cyc;
       end else begin : gen_no_align
          assign  o_ibus_adr  = wb_ibus_adr;
          assign  o_ibus_cyc  = wb_ibus_cyc;
+         assign  o_ibus_sel  = wb_ibus_sel;
          assign  wb_ibus_rdt = i_ibus_rdt;
          assign  wb_ibus_ack = i_ibus_ack;
         end
@@ -320,6 +326,7 @@ module serv_top
       .o_dbus_cyc     (o_dbus_cyc),
       .i_dbus_ack     (i_dbus_ack),
       .o_ibus_cyc     (wb_ibus_cyc),
+      .o_ibus_sel     (wb_ibus_sel),
       .i_ibus_ack     (wb_ibus_ack),
       //RF Interface
       .o_rf_rreq      (o_rf_rreq),
@@ -624,6 +631,7 @@ module serv_top
 	    .i_cnt_done   (cnt_done),
 	    .i_mem_op     (!mtval_pc),
 	    .i_mtip       (i_timer_irq),
+	    .i_seip       (i_seip),
 	    .i_trap       (trap),
 	    .o_new_irq    (new_irq),
 	    //Control
@@ -658,6 +666,7 @@ module serv_top
 	    .o_sum        (o_sum),
 	    .o_mxr        (o_mxr),
 	    .o_satp_mode  (o_satp_mode),
+	    .o_xlate      (o_xlate),
 	    .o_satp_ppn   (o_satp_ppn));
       end else begin : gen_no_csr
 	 assign csr_in = {W{1'b0}};
@@ -666,7 +675,7 @@ module serv_top
 	 assign trap_s = 1'b0;
 	 assign tval_pc = 1'b0;
 	 assign o_priv = 2'b11;
-	 assign {o_sum, o_mxr, o_satp_mode} = 3'b000;
+	 assign {o_sum, o_mxr, o_satp_mode, o_xlate} = 4'b0000;
 	 assign o_satp_ppn = 20'd0;
       end
    endgenerate
