@@ -13,7 +13,9 @@ module serv_csr
     /* LINUX=1: U-mode (one privilege bit; mstatus.MPP reads 00/11 and is writable),
        mstatus.MPIE readable/writable, mie and mip readable, ecall from U gives mcause 8,
        M-mode interrupts always enabled while in U-mode. LINUX=0 is upstream behaviour. */
-    parameter [0:0] LINUX = 0
+    parameter [0:0] LINUX = 0,
+    /* SMODE=1 (needs LINUX=1): S-mode for an SV32 Linux, see gen_smode below. */
+    parameter [0:0] SMODE = 0
   )
   (
    input wire 	    i_clk,
@@ -47,7 +49,24 @@ module serv_csr
    output wire 	[B:0]    o_csr_in,
    input wire 	[B:0]    i_csr_imm,
    input wire 	[B:0]    i_rs1,
-   output wire 	[B:0]    o_q);
+   output wire 	[B:0]    o_q,
+   //SMODE
+   input wire [2:0]  i_cnt_hi,       //serv_state o_cnt[4:2]
+   input wire [3:0]  i_cnt_lsb,      //serv_state cnt_r (one-hot for W=1, 1111 for W=4)
+   input wire        i_sret,
+   input wire [12:0] i_sel,          //serv_decode o_csr_sel (one-hot, see gen_smode)
+   input wire [63:0] i_mtime,
+   input wire        i_ibus_fault,   //instruction page fault, with the fetch ack
+   input wire        i_dbus_ack,
+   input wire        i_dbus_fault_we,//data page fault was a store/AMO, with the dbus ack
+   input wire        i_dfault,       //serv_state: this trap is a data page fault
+   output wire       o_trap_s,       //this trap goes to S-mode (stvec/sepc/stval)
+   output wire       o_tval_pc,      //this trap is an instruction page fault: tval = pc
+   output wire [1:0] o_priv,
+   output wire       o_sum,
+   output wire       o_mxr,
+   output wire       o_satp_mode,
+   output wire [19:0] o_satp_ppn);
 
    localparam [1:0]
      CSR_SOURCE_CSR = 2'b00,
@@ -96,10 +115,10 @@ module serv_csr
    wire 	mie_q = LINUX & i_mie_en & i_en & i_cnt7 & mie_mtie;
    wire 	mip_q = LINUX & i_mip_en & i_en & i_cnt7 & i_mtip;
 
-   assign csr_out = ({W{i_mstatus_en & i_en}} & mstatus) |
-		    i_rf_csr_out |
-		    ({W{i_mcause_en & i_en}} & mcause) |
-		    {mie_q | mip_q, {B{1'b0}}};
+   wire [B:0]	csr_out_classic = ({W{i_mstatus_en & i_en}} & mstatus) |
+				  i_rf_csr_out |
+				  ({W{i_mcause_en & i_en}} & mcause) |
+				  {mie_q | mip_q, {B{1'b0}}};
 
    assign o_q = csr_out;
 
@@ -130,6 +149,17 @@ module serv_csr
 		   : {W{1'b0}};
 
    assign o_csr_in = csr_in;
+
+   generate
+   if (!SMODE) begin : gen_classic
+   assign csr_out = csr_out_classic;
+   assign o_trap_s = 1'b0;
+   assign o_tval_pc = 1'b0;
+   assign o_priv = {2{mode_m}};
+   assign o_sum = 1'b0;
+   assign o_mxr = 1'b0;
+   assign o_satp_mode = 1'b0;
+   assign o_satp_ppn = 20'd0;
 
    always @(posedge i_clk) begin
       if (i_trig_irq) begin
@@ -216,5 +246,202 @@ module serv_csr
 	   mstatus_mpp <= 1'b1;
 	end
    end
+
+   end else begin : gen_smode
+   /*
+    SMODE: privilege U/S/M for an SV32 Linux (doc/stage2_plan.md in the QERV-Linux project).
+
+    CSRs here (one-hot i_sel from serv_decode):
+      0 mstatus 0x300: SIE 1, MIE 3, SPIE 5, MPIE 7, SPP 8, MPP 12:11, SUM 18, MXR 19
+                       (MPP = 10 is stored as 11)
+      1 sstatus 0x100: SIE, SPIE, SPP, SUM, MXR
+      2 mie   0x304: STIE 5, MTIE 7        3 sie 0x104: STIE (if delegated)
+      4 mip   0x344: STIP 5 (writable), MTIP 7 (CLINT)   5 sip 0x144: STIP (read-only)
+      6 mcause 0x342, 7 scause 0x142: bit 31 and bits 3:0
+      8 medeleg 0x302: bits 0,3,4,6,8,12,13,15     9 mideleg 0x303: bit 5 (STI)
+      10 satp 0x180: MODE 31, PPN 19:0 (ASID reads 0: no ASIDs)
+      11 time 0xC01, 12 timeh 0xC81: i_mtime, sampled at every fetch so that a read that
+         takes several cycles is not torn by a carry
+    stvec, sscratch, sepc and stval are in the RF (serv_rf_if), next to the M ones.
+
+    Every CSR is a parallel 32-bit view; at[i] marks the cycle in which bit i is on the
+    serial CSR bus (lane i%W). Synthesis keeps only the bits that are not constant.
+
+    Traps: interrupts are level-sensitive (MTI before STI) and sampled at each fetch; an
+    instruction page fault with the fetch is taken the same way (the fetched word is
+    replaced by a trap, tval = pc). A data page fault comes from serv_state (i_dfault).
+    The trap goes to S when the hart is below M and the cause is delegated.
+    */
+   wire [31:0] at;
+   genvar      gi;
+   for (gi = 0; gi < 32; gi = gi + 1) begin : gen_at
+      assign at[gi] = i_en & (i_cnt_hi == (gi / 4)) & ((W == 4) | i_cnt_lsb[gi % 4]);
+   end
+   wire [31:0] wr_at = at & {32{csr_wr_ok}};
+
+   reg [1:0]  priv;
+   reg 	      m_ie, m_pie, mpp1, mpp0, s_ie, s_pie, s_pp, sum, mxr;
+   reg 	      mtie, stie, stip, mideleg5;
+   reg [15:0] medeleg;
+   reg 	      m_int, s_int;
+   reg [3:0]  m_code, s_code;
+   reg 	      satp_mode;
+   reg [19:0] satp_ppn;
+   reg [63:0] mtime_s;
+   reg 	      new_int, int_m, new_ifault, dfault_we;
+
+   wire       s_mstatus = i_sel[0],  s_sstatus = i_sel[1],  s_mie   = i_sel[2];
+   wire       s_sie     = i_sel[3],  s_mip     = i_sel[4],  s_sip   = i_sel[5];
+   wire       s_mcause  = i_sel[6],  s_scause  = i_sel[7],  s_medeleg = i_sel[8];
+   wire       s_mideleg = i_sel[9],  s_satp    = i_sel[10], s_time  = i_sel[11];
+   wire       s_timeh   = i_sel[12];
+
+   wire [15:0] medeleg_m = medeleg & 16'hB159;
+
+   wire [31:0] v_status  = {12'd0, mxr, sum, 5'd0, mpp1, mpp1 | mpp0, 2'd0, s_pp, m_pie, 1'b0,
+			    s_pie, 1'b0, m_ie, 1'b0, s_ie, 1'b0};
+   wire [31:0] v_mie     = {24'd0, mtie, 1'b0, stie, 5'd0};
+   wire [31:0] v_mip     = {24'd0, i_mtip, 1'b0, stip, 5'd0};
+   wire [31:0] v_sie     = {26'd0, stie & mideleg5, 5'd0};
+   wire [31:0] v_sip     = {26'd0, stip & mideleg5, 5'd0};
+   wire [31:0] v_mcause  = {m_int, 27'd0, m_code};
+   wire [31:0] v_scause  = {s_int, 27'd0, s_code};
+   wire [31:0] v_medeleg = {16'd0, medeleg_m};
+   wire [31:0] v_mideleg = {26'd0, mideleg5, 5'd0};
+   wire [31:0] v_satp    = {satp_mode, 11'd0, satp_ppn};
+
+   wire [31:0] v = ({32{s_mstatus}} & v_status) |
+		   ({32{s_sstatus}} & v_status & 32'h000C0122) |
+		   ({32{s_mie}}     & v_mie)     | ({32{s_sie}}     & v_sie) |
+		   ({32{s_mip}}     & v_mip)     | ({32{s_sip}}     & v_sip) |
+		   ({32{s_mcause}}  & v_mcause)  | ({32{s_scause}}  & v_scause) |
+		   ({32{s_medeleg}} & v_medeleg) | ({32{s_mideleg}} & v_mideleg) |
+		   ({32{s_satp}}    & v_satp)    |
+		   ({32{s_time}}    & mtime_s[31:0]) | ({32{s_timeh}} & mtime_s[63:32]);
+
+   localparam [31:0] LANE0 = (W == 4) ? 32'h11111111 : 32'hFFFFFFFF;
+   wire [B:0]  sv;
+   genvar      gl;
+   for (gl = 0; gl < W; gl = gl + 1) begin : gen_lane
+      assign sv[gl] = |(v & at & (LANE0 << gl));
+   end
+   assign csr_out = sv | i_rf_csr_out;
+
+   wire        m_mode = priv[1];
+   wire        s_mode = !priv[1] & priv[0];
+   wire        u_mode = !priv[1] & !priv[0];
+   /* The privilege the trap was taken from. priv changes at trap_done, but the RF writes of
+      the tval/epc CSRs trail the counter by a cycle and their address depends on trap_s
+      (whose ecall cause and delegation depend on the privilege), and i_trap stays high
+      until the next fetch. */
+   reg [1:0]   tpriv;
+   wire [1:0]  cur_priv = i_trap ? tpriv : priv;
+   wire        mti = i_mtip & mtie & (!m_mode | m_ie);
+   wire        sti = stip & stie & (mideleg5 ? (u_mode | (s_mode & s_ie)) : (!m_mode | m_ie));
+   wire        irq = mti | sti;
+
+   wire [3:0]  code = new_int    ? (int_m ? 4'd7 : 4'd5) :
+		      new_ifault ? 4'd12 :
+		      i_e_op     ? (i_ebreak ? 4'd3 : {2'b10, cur_priv}) :
+		      i_dfault   ? (dfault_we ? 4'd15 : 4'd13) :
+		      i_mem_op   ? (i_mem_cmd ? 4'd6 : 4'd4) :
+		      4'd0;
+   wire        trap_s = !cur_priv[1] & (new_int ? (!int_m & mideleg5) : medeleg_m[code]);
+
+   wire        sret_done = i_sret & !i_trap & i_cnt_done;
+
+   assign o_trap_s    = trap_s;
+   assign o_tval_pc   = new_ifault;
+   assign o_priv      = priv;
+   assign o_sum       = sum;
+   assign o_mxr       = mxr;
+   assign o_satp_mode = satp_mode;
+   assign o_satp_ppn  = satp_ppn;
+
+   integer     k;
+   always @(posedge i_clk) begin
+      if (i_trig_irq) begin
+	 mtime_s    <= i_mtime;
+	 new_int    <= irq;
+	 int_m      <= mti;
+	 new_ifault <= i_ibus_fault & !irq;
+	 o_new_irq  <= irq | i_ibus_fault;
+      end
+      if (i_dbus_ack)
+	dfault_we <= i_dbus_fault_we;
+      if (!i_trap)
+	tpriv <= priv;
+
+      //CSR instructions (never in the same cycle as a trap entry or xret completion)
+      if ((s_mstatus | s_sstatus) & wr_at[1])  s_ie  <= csr_in[1 % W];
+      if (s_mstatus & wr_at[3])                m_ie  <= csr_in[3 % W];
+      if ((s_mstatus | s_sstatus) & wr_at[5])  s_pie <= csr_in[5 % W];
+      if (s_mstatus & wr_at[7])                m_pie <= csr_in[7 % W];
+      if ((s_mstatus | s_sstatus) & wr_at[8])  s_pp  <= csr_in[8 % W];
+      if (s_mstatus & wr_at[11])               mpp0  <= csr_in[11 % W];
+      if (s_mstatus & wr_at[12])               mpp1  <= csr_in[12 % W];
+      if ((s_mstatus | s_sstatus) & wr_at[18]) sum   <= csr_in[18 % W];
+      if ((s_mstatus | s_sstatus) & wr_at[19]) mxr   <= csr_in[19 % W];
+      if (s_mie & wr_at[7])                    mtie  <= csr_in[7 % W];
+      if ((s_mie | (s_sie & mideleg5)) & wr_at[5]) stie <= csr_in[5 % W];
+      if (s_mip & wr_at[5])                    stip  <= csr_in[5 % W];
+      if (s_mideleg & wr_at[5])                mideleg5 <= csr_in[5 % W];
+      if (s_mcause & wr_at[31])                m_int <= csr_in[31 % W];
+      if (s_scause & wr_at[31])                s_int <= csr_in[31 % W];
+      if (s_satp & wr_at[31])                  satp_mode <= csr_in[31 % W];
+      for (k = 0; k < 4; k = k + 1) begin
+	 if (s_mcause & wr_at[k]) m_code[k] <= csr_in[k % W];
+	 if (s_scause & wr_at[k]) s_code[k] <= csr_in[k % W];
+      end
+      for (k = 0; k < 16; k = k + 1)
+	if (s_medeleg & wr_at[k]) medeleg[k] <= csr_in[k % W];
+      for (k = 0; k < 20; k = k + 1)
+	if (s_satp & wr_at[k]) satp_ppn[k] <= csr_in[k % W];
+
+      if (trap_done) begin
+	 if (trap_s) begin
+	    s_int <= new_int;
+	    s_code <= code;
+	    s_pie <= s_ie;
+	    s_ie <= 1'b0;
+	    s_pp <= priv[0];
+	    priv <= 2'b01;
+	 end else begin
+	    m_int <= new_int;
+	    m_code <= code;
+	    m_pie <= m_ie;
+	    m_ie <= 1'b0;
+	    {mpp1, mpp0} <= priv;
+	    priv <= 2'b11;
+	 end
+      end
+      if (mret_done) begin
+	 priv <= {mpp1, mpp1 | mpp0};
+	 m_ie <= m_pie;
+	 m_pie <= 1'b1;
+	 {mpp1, mpp0} <= 2'b00;
+      end
+      if (sret_done) begin
+	 priv <= {1'b0, s_pp};
+	 s_ie <= s_pie;
+	 s_pie <= 1'b1;
+	 s_pp <= 1'b0;
+      end
+
+      if (i_rst) begin
+	 priv <= 2'b11;
+	 {m_ie, m_pie, mpp1, mpp0, s_ie, s_pie, s_pp, sum, mxr} <= 9'd0;
+	 {mtie, stie, stip, mideleg5} <= 4'd0;
+	 medeleg <= 16'd0;
+	 {m_int, s_int, m_code, s_code} <= 10'd0;
+	 satp_mode <= 1'b0;
+	 satp_ppn <= 20'd0;
+	 {new_int, int_m, new_ifault, dfault_we} <= 4'd0;
+	 o_new_irq <= 1'b0;
+      end
+   end
+
+   end
+   endgenerate
 
 endmodule

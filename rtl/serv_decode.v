@@ -12,7 +12,10 @@ module serv_decode
        A extension (AMO/LR/SC as one dbus transaction carrying funct5, executed outside the
        core), exact 12-bit CSR decode (unimplemented CSRs read 0, writes ignored), mip
        readable, fence/fence.i/wfi as no-ops. LINUX=0 is bit-identical to upstream. */
-    parameter [0:0] LINUX = 0)
+    parameter [0:0] LINUX = 0,
+    /* SMODE=1 (with LINUX=1): exact decode of ecall/ebreak/mret/sret/sfence.vma, the S-mode
+       CSRs (S group of the RF CSRs, o_csr_sel for the ones in serv_csr). */
+    parameter [0:0] SMODE = 0)
   (
    input wire        clk,
    //Input
@@ -46,6 +49,8 @@ module serv_decode
    output reg       o_ctrl_utype,
    output reg       o_ctrl_pc_rel,
    output reg       o_ctrl_mret,
+   output reg       o_ctrl_sret,
+   output reg       o_sfence,
    //To alu
    output reg       o_alu_sub,
    output reg [1:0] o_alu_bool_op,
@@ -60,6 +65,8 @@ module serv_decode
    //To CSR
    output reg       o_csr_en,
    output reg [1:0] o_csr_addr,
+   output reg       o_csr_s,
+   output reg [12:0] o_csr_sel,
    output reg       o_csr_mstatus_en,
    output reg       o_csr_mie_en,
    output reg       o_csr_mcause_en,
@@ -163,11 +170,16 @@ module serv_decode
 
    //opcode & funct3 & op21
 
-   wire co_ctrl_mret = opcode[4] & opcode[2] & op21 & !(|funct3);
+   wire sys0 = opcode[4] & opcode[2] & !(|funct3);
+   wire co_ctrl_mret = SMODE ? sys0 & (imm31_20 == 12'h302) : opcode[4] & opcode[2] & op21 & !(|funct3);
+   wire co_ctrl_sret = SMODE & sys0 & (imm31_20 == 12'h102);
+   //SMODE: sfence.vma (funct7 0001001, any rs1/rs2) runs as a no-op; o_sfence flushes the TLB
+   wire co_sfence = SMODE & sys0 & (imm31_20[11:5] == 7'b0001001);
    //Matches system opcodes except CSR accesses (funct3 == 0)
    //and mret (!op21). With LINUX, wfi (0x105, the only one with bit 22 set) is excluded and
    //executes as a no-op instead of trapping like ebreak.
-   wire co_e_op = opcode[4] & opcode[2] & !op21 & !(|funct3) & !(LINUX & op22);
+   wire co_e_op = SMODE ? sys0 & (imm31_20[11:1] == 11'd0) :
+                  opcode[4] & opcode[2] & !op21 & !(|funct3) & !(LINUX & op22);
 
    //opcode & funct3 & imm30
 
@@ -222,8 +234,21 @@ module serv_decode
 
    //true  for mtvec,mscratch,mepc and mtval
    //false for mstatus, mie, mcause
-   wire csr_valid = LINUX ? (csr_is_mtvec | csr_is_mscratch | csr_is_mepc | csr_is_mtval) :
+   //SMODE: stvec 0x105, sscratch 0x140, sepc 0x141, stval 0x143 use the same low address
+   //bits as the M ones, in the S group of the RF CSRs (o_csr_s)
+   wire csr_is_srf = (imm31_20 == 12'h105) | (imm31_20 == 12'h140) |
+                     (imm31_20 == 12'h141) | (imm31_20 == 12'h143);
+   wire csr_valid = LINUX ? (csr_is_mtvec | csr_is_mscratch | csr_is_mepc | csr_is_mtval |
+                             (SMODE & csr_is_srf)) :
                     (op20 | (op26 & !op21));
+   wire co_csr_s = SMODE & csr_is_srf;
+   //SMODE: CSRs implemented in serv_csr (gen_smode), one-hot
+   wire [12:0] co_csr_sel = {13{SMODE & csr_op}} &
+                            {imm31_20 == 12'hC81, imm31_20 == 12'hC01, imm31_20 == 12'h180,
+                             imm31_20 == 12'h303, imm31_20 == 12'h302, imm31_20 == 12'h142,
+                             imm31_20 == 12'h342, imm31_20 == 12'h144, imm31_20 == 12'h344,
+                             imm31_20 == 12'h104, imm31_20 == 12'h304, imm31_20 == 12'h100,
+                             imm31_20 == 12'h300};
 
    wire co_rd_csr_en = csr_op;
 
@@ -309,6 +334,8 @@ module serv_decode
             o_ctrl_utype       = co_ctrl_utype;
             o_ctrl_pc_rel      = co_ctrl_pc_rel;
             o_ctrl_mret        = co_ctrl_mret;
+            o_ctrl_sret        = co_ctrl_sret;
+            o_sfence           = co_sfence;
             o_alu_sub          = co_alu_sub;
             o_alu_bool_op      = co_alu_bool_op;
             o_alu_cmp_eq       = co_alu_cmp_eq;
@@ -320,6 +347,8 @@ module serv_decode
             o_mem_cmd          = co_mem_cmd;
             o_csr_en           = co_csr_en;
             o_csr_addr         = co_csr_addr;
+            o_csr_s            = co_csr_s;
+            o_csr_sel          = co_csr_sel;
             o_csr_mstatus_en   = co_csr_mstatus_en;
             o_csr_mie_en       = co_csr_mie_en;
             o_csr_mcause_en    = co_csr_mcause_en;
@@ -368,6 +397,8 @@ module serv_decode
                o_ctrl_utype       <= co_ctrl_utype;
                o_ctrl_pc_rel      <= co_ctrl_pc_rel;
                o_ctrl_mret        <= co_ctrl_mret;
+               o_ctrl_sret        <= co_ctrl_sret;
+               o_sfence           <= co_sfence;
                o_alu_sub          <= co_alu_sub;
                o_alu_bool_op      <= co_alu_bool_op;
                o_alu_cmp_eq       <= co_alu_cmp_eq;
@@ -379,6 +410,8 @@ module serv_decode
                o_mem_cmd          <= co_mem_cmd;
                o_csr_en           <= co_csr_en;
                o_csr_addr         <= co_csr_addr;
+               o_csr_s            <= co_csr_s;
+               o_csr_sel          <= co_csr_sel;
                o_csr_mstatus_en   <= co_csr_mstatus_en;
                o_csr_mie_en       <= co_csr_mie_en;
                o_csr_mcause_en    <= co_csr_mcause_en;

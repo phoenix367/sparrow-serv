@@ -19,7 +19,11 @@ module serv_top
     parameter [0:0] ALIGN = COMPRESSED,
     /* LINUX=1: A extension (see o_dbus_amo), U-mode, exact CSR decode, fence/wfi as
        no-ops. Needed to run an M-mode no-MMU Linux kernel. */
-    parameter [0:0] LINUX = 1'b0)
+    parameter [0:0] LINUX = 1'b0,
+    /* SMODE=1 (with LINUX=1): S-mode and the hooks for an external SV32 MMU (privilege,
+       SUM/MXR and satp out; page faults in with the bus acks; sfence.vma pulse; time CSR
+       from i_mtime). */
+    parameter [0:0] SMODE = 1'b0)
    (
    input wire 		      clk,
    input wire 		      i_rst,
@@ -86,7 +90,18 @@ module serv_top
    output wire [31:0] o_ext_rs1,
    output wire [31:0] o_ext_rs2,
    //MDU
-   output wire        o_mdu_valid);
+   output wire        o_mdu_valid,
+   //SMODE: MMU interface
+   input wire [63:0]  i_mtime,
+   input wire         i_ibus_fault,     //with i_ibus_ack: instruction page fault
+   input wire         i_dbus_fault,     //with i_dbus_ack: load/store/AMO page fault
+   input wire         i_dbus_fault_we,  //with i_dbus_fault: it was a store/AMO fault
+   output wire [1:0]  o_priv,
+   output wire        o_sum,
+   output wire        o_mxr,
+   output wire        o_satp_mode,
+   output wire [19:0] o_satp_ppn,
+   output wire        o_sfence);       //one cycle per executed sfence.vma
 
    wire [4:0]    rd_addr;
    wire [4:0]    rs1_addr;
@@ -120,6 +135,15 @@ module serv_top
    wire          jal_or_jalr;
    wire          utype;
    wire 	 mret;
+   wire 	 sret;
+   wire 	 sfence;
+   wire 	 csr_s;
+   wire [12:0] 	 csr_sel;
+   wire [2:0] 	 cnt_hi;
+   wire [3:0] 	 cnt_lsb;
+   wire 	 dfault;
+   wire 	 trap_s;
+   wire 	 tval_pc;
    wire [B:0]    imm;
    wire 	 trap;
    wire 	 pc_rel;
@@ -242,7 +266,8 @@ module serv_top
        .WITH_CSR (WITH_CSR[0:0]),
        .MDU(MDU),
        .ALIGN(ALIGN),
-       .W(W))
+       .W(W),
+       .SMODE(SMODE))
    state
      (
       .i_clk (clk),
@@ -262,6 +287,10 @@ module serv_top
       .o_cnt11        (cnt11),
       .o_cnt12        (cnt12),
       .o_cnt_done     (cnt_done),
+      .o_cnt_hi       (cnt_hi),
+      .o_cnt_lsb      (cnt_lsb),
+      .i_dbus_fault   (i_dbus_fault),
+      .o_dfault       (dfault),
       .o_bufreg_en    (bufreg_en),
       .o_ctrl_pc_en   (ctrl_pc_en),
       .o_ctrl_jump    (jump),
@@ -303,7 +332,8 @@ module serv_top
    serv_decode
      #(.PRE_REGISTER (PRE_REGISTER),
        .MDU(MDU),
-       .LINUX(LINUX))
+       .LINUX(LINUX),
+       .SMODE(SMODE))
    decode
      (
       .clk (clk),
@@ -339,6 +369,8 @@ module serv_top
       .o_ctrl_utype       (utype),
       .o_ctrl_pc_rel      (pc_rel),
       .o_ctrl_mret        (mret),
+      .o_ctrl_sret        (sret),
+      .o_sfence           (sfence),
       //To alu
       .o_alu_sub          (alu_sub),
       .o_alu_bool_op      (alu_bool_op),
@@ -353,6 +385,8 @@ module serv_top
       //To CSR
       .o_csr_en           (csr_en),
       .o_csr_addr         (csr_addr),
+      .o_csr_s            (csr_s),
+      .o_csr_sel          (csr_sel),
       .o_csr_mstatus_en   (csr_mstatus_en),
       .o_csr_mie_en       (csr_mie_en),
       .o_csr_mcause_en    (csr_mcause_en),
@@ -464,7 +498,7 @@ module serv_top
       .i_jal_or_jalr (jal_or_jalr),
       .i_utype    (utype),
       .i_pc_rel   (pc_rel),
-      .i_trap     (trap | mret),
+      .i_trap     (trap | mret | sret),
       .i_iscomp    (iscomp),
       //Data
       .i_imm      (imm),
@@ -495,7 +529,7 @@ module serv_top
       .o_rd       (alu_rd));
 
    serv_rf_if
-     #(.WITH_CSR (WITH_CSR), .W(W))
+     #(.WITH_CSR (WITH_CSR), .W(W), .SMODE(SMODE))
    rf_if
      (//RF interface
       .i_cnt_en    (cnt_en),
@@ -513,6 +547,10 @@ module serv_top
       //Trap interface
       .i_trap      (trap),
       .i_mret      (mret),
+      .i_sret      (sret),
+      .i_trap_s    (trap_s),
+      .i_tval_pc   (tval_pc),
+      .i_csr_s     (csr_s),
       .i_mepc      (wb_ibus_adr[B:0]),
       .i_mtval_pc  (mtval_pc),
       .i_bufreg_q  (bufreg_q),
@@ -569,7 +607,8 @@ module serv_top
 	 serv_csr
 	   #(.RESET_STRATEGY (RESET_STRATEGY),
 	     .W(W),
-	     .LINUX(LINUX))
+	     .LINUX(LINUX),
+	     .SMODE(SMODE))
 	 csr
 	   (
 	    .i_clk        (clk),
@@ -603,11 +642,32 @@ module serv_top
 	    .o_csr_in     (csr_in),
 	    .i_csr_imm    (csr_imm),
 	    .i_rs1        (rs1),
-	    .o_q          (csr_rd));
+	    .o_q          (csr_rd),
+	    .i_cnt_hi     (cnt_hi),
+	    .i_cnt_lsb    (cnt_lsb),
+	    .i_sret       (sret),
+	    .i_sel        (csr_sel),
+	    .i_mtime      (i_mtime),
+	    .i_ibus_fault (i_ibus_fault),
+	    .i_dbus_ack   (i_dbus_ack),
+	    .i_dbus_fault_we (i_dbus_fault_we),
+	    .i_dfault     (dfault),
+	    .o_trap_s     (trap_s),
+	    .o_tval_pc    (tval_pc),
+	    .o_priv       (o_priv),
+	    .o_sum        (o_sum),
+	    .o_mxr        (o_mxr),
+	    .o_satp_mode  (o_satp_mode),
+	    .o_satp_ppn   (o_satp_ppn));
       end else begin : gen_no_csr
 	 assign csr_in = {W{1'b0}};
 	 assign csr_rd = {W{1'b0}};
 	 assign new_irq = 1'b0;
+	 assign trap_s = 1'b0;
+	 assign tval_pc = 1'b0;
+	 assign o_priv = 2'b11;
+	 assign {o_sum, o_mxr, o_satp_mode} = 3'b000;
+	 assign o_satp_ppn = 20'd0;
       end
    endgenerate
 
@@ -675,6 +735,8 @@ module serv_top
       end
    endgenerate
 
+
+   assign o_sfence = SMODE & sfence & cnt_done & !trap;
 
 generate
   if (MDU) begin: gen_mdu

@@ -37,9 +37,11 @@ module serv_rf_top
     parameter WITH_CSR = 1,
     /* LINUX=1: A extension, U-mode, exact CSR decode, fence/wfi as no-ops (serv_top) */
     parameter [0:0] LINUX = 1'b0,
+    /* SMODE=1 (with LINUX=1): S-mode + SV32 MMU hooks (serv_top); 4 more RF CSRs */
+    parameter [0:0] SMODE = 1'b0,
     parameter W        = 1,
     parameter RF_WIDTH = W * 2,
-	parameter RF_L2D   = $clog2((32+(WITH_CSR*4))*32/RF_WIDTH))
+	parameter RF_L2D   = $clog2((32+(WITH_CSR*(SMODE ? 8 : 4)))*32/RF_WIDTH))
   (
    input wire 	      clk,
    input wire 	      i_rst,
@@ -88,9 +90,20 @@ module serv_rf_top
    input  wire [31:0] i_ext_rd,
    input  wire        i_ext_ready,
    // MDU
-   output wire        o_mdu_valid);
+   output wire        o_mdu_valid,
+   // SMODE: MMU interface (see serv_top)
+   input wire [63:0]  i_mtime,
+   input wire         i_ibus_fault,
+   input wire         i_dbus_fault,
+   input wire         i_dbus_fault_we,
+   output wire [1:0]  o_priv,
+   output wire        o_sum,
+   output wire        o_mxr,
+   output wire        o_satp_mode,
+   output wire [19:0] o_satp_ppn,
+   output wire        o_sfence);
 
-   localparam CSR_REGS = WITH_CSR*4;
+   localparam CSR_REGS = WITH_CSR*(SMODE ? 8 : 4);
 
    wire 	      rf_wreq;
    wire 	      rf_rreq;
@@ -161,6 +174,7 @@ module serv_rf_top
        .DEBUG (DEBUG),
        .MDU(MDU),
        .LINUX(LINUX),
+       .SMODE(SMODE),
        .COMPRESSED(COMPRESSED),
        .ALIGN(ALIGN),
        .W(W))
@@ -228,7 +242,18 @@ module serv_rf_top
       .o_ext_rs1    (o_ext_rs1),
       .o_ext_rs2    (o_ext_rs2),
       //MDU
-      .o_mdu_valid  (o_mdu_valid));
+      .o_mdu_valid  (o_mdu_valid),
+      //SMODE
+      .i_mtime        (i_mtime),
+      .i_ibus_fault   (i_ibus_fault),
+      .i_dbus_fault   (i_dbus_fault),
+      .i_dbus_fault_we(i_dbus_fault_we),
+      .o_priv         (o_priv),
+      .o_sum          (o_sum),
+      .o_mxr          (o_mxr),
+      .o_satp_mode    (o_satp_mode),
+      .o_satp_ppn     (o_satp_ppn),
+      .o_sfence       (o_sfence));
 
 endmodule
 `default_nettype wire

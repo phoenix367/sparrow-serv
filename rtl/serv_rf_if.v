@@ -8,7 +8,11 @@
 module serv_rf_if
   #(parameter WITH_CSR = 1,
     parameter W = 1,
-    parameter B = W-1
+    parameter B = W-1,
+    /* SMODE: four more RF CSRs (sscratch, stvec, sepc, stval at 36-39). A trap to S
+       (i_trap_s), sret and S CSR accesses (i_csr_s) use them. An instruction page fault
+       (i_tval_pc) writes the pc to the tval CSR. */
+    parameter [0:0] SMODE = 0
   )
   (//RF Interface
    input wire 		      i_cnt_en,
@@ -26,6 +30,10 @@ module serv_rf_if
    //Trap interface
    input wire 		      i_trap,
    input wire 		      i_mret,
+   input wire                 i_sret,
+   input wire                 i_trap_s,
+   input wire                 i_tval_pc,
+   input wire                 i_csr_s,
    input wire [B:0] i_mepc,
    input wire                      i_mtval_pc,
    input wire [B:0] i_bufreg_q,
@@ -69,7 +77,7 @@ module serv_rf_if
        {W{i_rd_mem_en}} & i_mem_rd |
                        i_ctrl_rd;
 
-   wire [B:0]  mtval = i_mtval_pc ? i_bad_pc : i_bufreg_q;
+   wire [B:0]  mtval = (SMODE & i_tval_pc) ? i_mepc : i_mtval_pc ? i_bad_pc : i_bufreg_q;
 
    assign 	     o_wdata0 = i_trap ? mtval  : rd;
    assign	     o_wdata1 = i_trap ? i_mepc : i_csr;
@@ -85,8 +93,11 @@ module serv_rf_if
     * mtval    100011
     */
 
-   assign o_wreg0 = i_trap ? {6'b100011} : {1'b0,i_rd_waddr};
-   assign o_wreg1 = i_trap ? {6'b100010} : {4'b1000,i_csr_addr};
+   //SMODE: S group bit (address bit 2) for the trap target / sret / S CSR accesses
+   wire        grp_trap = SMODE & i_trap_s;
+   wire        grp_csr  = SMODE & i_csr_s;
+   assign o_wreg0 = i_trap ? {3'b100, grp_trap, 2'b11} : {1'b0,i_rd_waddr};
+   assign o_wreg1 = i_trap ? {3'b100, grp_trap, 2'b10} : {3'b100, grp_csr, i_csr_addr};
 
    assign       o_wen0 = i_cnt_en & (i_trap | rd_wen);
    assign       o_wen1 = i_cnt_en & (i_trap | i_csr_en);
@@ -119,10 +130,20 @@ module serv_rf_if
 
     The expression below is an optimized version of this logic
     */
+   if (SMODE) begin : gen_rreg1_smode
+      /* An interrupt or fetch fault can replace an mret/sret (M interrupts are taken in
+	 S-mode regardless of SIE), so the trap wins here. */
+      wire xret = (i_mret | i_sret) & !i_trap;
+      assign o_rreg1 = i_trap   ? {3'b100, grp_trap, 2'b01} :
+		       xret     ? {3'b100, i_sret, 2'b10} :
+		       i_csr_en ? {3'b100, grp_csr, i_csr_addr} :
+		                  {1'b0, i_rs2_raddr};
+   end else begin : gen_rreg1
    wire sel_rs2 = !(i_trap | i_mret | i_csr_en);
    assign o_rreg1 = {~sel_rs2,
 		     i_rs2_raddr[4:2] & {3{sel_rs2}},
 		     {1'b0,i_trap} | {i_mret,1'b0} | ({2{i_csr_en}} & i_csr_addr) | ({2{sel_rs2}} & i_rs2_raddr[1:0])};
+   end
 
    assign o_rs1 = i_rdata0;
    assign o_rs2 = i_rdata1;

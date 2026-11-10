@@ -9,7 +9,10 @@ module serv_state
     parameter [0:0] WITH_CSR = 1,
     parameter [0:0] ALIGN =0,
     parameter [0:0] MDU = 0,
-    parameter       W = 1
+    parameter       W = 1,
+    /* SMODE: a dbus ack with i_dbus_fault (page fault) starts a trap stage instead of the rd
+       write, like a misaligned access does (bufreg still holds the address for tval). */
+    parameter [0:0] SMODE = 0
   )
   (
    input wire 	     i_clk,
@@ -29,6 +32,10 @@ module serv_state
    output wire 	     o_cnt11,
    output wire 	     o_cnt12,
    output wire 	     o_cnt_done,
+   output wire [2:0] o_cnt_hi,
+   output wire [3:0] o_cnt_lsb,
+   input wire        i_dbus_fault,
+   output wire       o_dfault,
    output wire 	     o_bufreg_en,
    output wire 	     o_ctrl_pc_en,
    output reg 	     o_ctrl_jump,
@@ -66,6 +73,8 @@ module serv_state
    output wire 	     o_rf_rd_en);
 
    reg 	init_done;
+   wire dbus_fault = SMODE & i_dbus_fault;
+   reg  dfault_sync;
    wire misalign_trap_sync;
 
    reg [4:2] o_cnt;
@@ -112,7 +121,7 @@ module serv_state
    //Mem ops. i_dbus_ack
    //MDU ops. i_mdu_ready
    assign o_rf_wreq = (i_shift_op & (i_sh_right ? (i_sh_done & (last_init | !o_cnt_en & init_done)) : last_init)) |
-	   	       i_dbus_ack | (MDU & i_mdu_ready) |
+	   	       (i_dbus_ack & !dbus_fault) | (MDU & i_mdu_ready) |
 	   	      (i_branch_op & (last_init & !trap_pending)) |
 	   	      (i_rd_alu_en & i_alu_rd_sel1 & last_init);
 
@@ -120,7 +129,7 @@ module serv_state
 
    //Prepare RF for reads when a new instruction is fetched
    // or when stage one caused an exception (rreq implies a write request too)
-   assign o_rf_rreq = i_ibus_ack | (trap_pending & last_init);
+   assign o_rf_rreq = i_ibus_ack | (trap_pending & last_init) | (i_dbus_ack & dbus_fault);
 
    assign o_rf_rd_en = i_rd_op & !o_init;
 
@@ -143,6 +152,8 @@ module serv_state
    assign o_init = i_two_stage_op & !i_new_irq & !init_done;
 
    assign o_cnt_done = (o_cnt[4:2] == 3'b111) & cnt_r[3];
+   assign o_cnt_hi   = o_cnt[4:2];
+   assign o_cnt_lsb  = cnt_r;
 
    always @(posedge i_clk) begin
       //ibus_cyc changes on three conditions.
@@ -221,7 +232,15 @@ module serv_state
       end
    endgenerate
 
-   assign o_ctrl_trap = WITH_CSR & (i_e_op | i_new_irq | misalign_trap_sync);
+   assign o_ctrl_trap = WITH_CSR & (i_e_op | i_new_irq | misalign_trap_sync | dfault_sync);
+
+   //SMODE: data page fault, from the dbus ack until the next fetch
+   always @(posedge i_clk)
+     if (i_rst | i_ibus_ack)            //held until the next fetch, like misalign_trap_sync:
+       dfault_sync <= 1'b0;            //the last RF writes of the trap trail cnt_done
+     else if (i_dbus_ack & dbus_fault)
+       dfault_sync <= 1'b1;
+   assign o_dfault = SMODE & dfault_sync;
 
    generate
       if (WITH_CSR) begin : gen_csr
