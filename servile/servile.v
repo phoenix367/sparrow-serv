@@ -272,6 +272,24 @@ module servile
       .o_ext_funct3 (mdu_op),
       .i_ext_rd     (mdu_rd),
       .i_ext_ready  (mdu_ready),
+      //Sparrow-SERV extensions (LINUX=0, SMODE=0 here: unused, inputs tied off)
+      .o_ibus_sel      (),
+      .o_dbus_amo      (),
+      .o_dbus_amo_op   (),
+      .o_dbus_cmo      (),
+      .o_dbus_cmo_op   (),
+      .i_mtime         (64'd0),
+      .i_seip          (1'b0),
+      .i_ibus_fault    (1'b0),
+      .i_dbus_fault    (1'b0),
+      .i_dbus_fault_we (1'b0),
+      .o_priv          (),
+      .o_sum           (),
+      .o_mxr           (),
+      .o_satp_mode     (),
+      .o_xlate         (),
+      .o_satp_ppn      (),
+      .o_sfence        (),
       //MDU
       .o_mdu_valid  (mdu_valid));
 

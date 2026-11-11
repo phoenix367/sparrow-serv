@@ -1,13 +1,13 @@
 `verilator_config
 // Bits [1:0] in i_wb_rdt are not used at all
-lint_off -rule UNUSED -file "*/serv_top.v" -lines 185
+lint_off -rule UNUSED -file "*/serv_top.v" -lines 226
 
 //Some bits in the instruction word are not used in serv_decode but it's easier
 //to just send in the whole word than picking out bits
-lint_off -rule UNUSED -file "*/serv_decode.v" -lines 14
+lint_off -rule UNUSED -file "*/serv_decode.v" -lines 23
 
 //Some variables are only used when we connect an Extension with serv_decode
-lint_off -rule UNUSED -file "*/serv_top.v" -lines 76
+lint_off -rule UNUSED -file "*/serv_top.v" -lines 95
 
 //Some bufreg signals are not used in 1-bit mode
 lint_off -rule UNUSED -file "*/serv_bufreg.v" -lines 16
@@ -17,3 +17,8 @@ lint_off -rule UNUSED -file "*/serv_bufreg.v" -lines 25-27
 lint_off -rule UNUSED -file "*/serv_immdec.v" -lines 17
 lint_off -rule UNUSED -file "*/serv_bufreg.v" -lines 15
 lint_off -rule UNUSED -file "*/serv_ctrl.v" -lines 23
+
+//Sparrow-SERV: inputs that only SMODE=1 (S-mode, MMU hooks) uses
+lint_off -rule UNUSED -file "*/serv_csr.v" -lines 34
+lint_off -rule UNUSED -file "*/serv_csr.v" -lines 55-63
+lint_off -rule UNUSED -file "*/serv_rf_if.v" -lines 33
