@@ -7,14 +7,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout riscv-formal
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: YosysHQ/riscv-formal
       - name: Checkout SERV
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: cores/serv/serv-src
-      - uses: YosysHQ/setup-oss-cad-suite@v3
+      - uses: YosysHQ/setup-oss-cad-suite@v4
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Prepare formal tests
