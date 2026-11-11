@@ -1,3 +1,78 @@
+# Sparrow-SERV
+
+Sparrow-SERV is a fork of [SERV](https://github.com/olofk/serv), Olof Kindgren's bit-serial
+RISC-V core, extended so that it can run Linux. It is the CPU of
+[tang_nano_9K_linux](https://github.com/phoenix367/tang_nano_9K_linux), which boots an SV32
+Linux kernel to a shell on a Sipeed Tang Nano 9K (GW1NR-9 FPGA, 8 MB PSRAM). There the core
+runs 4 bits per cycle (`W=4`) at 42 MHz.
+
+The work is on the `qerv-linux` branch. Everything is behind two new parameters of
+`serv_top` and `serv_rf_top`. With both at 0 (the default) the core is upstream SERV, with the
+same logic and the same cycle counts.
+
+## `LINUX=1`: what an M-mode, no-MMU Linux needs
+
+- **A extension.** LR/SC and the AMOs leave as one data-bus transaction marked by `o_dbus_amo`
+  and `o_dbus_amo_op`. A unit outside the core does the read-modify-write (`amo_unit.v` in
+  the parent project).
+- **U-mode.** `mstatus.MPP` (00/11) and `MPIE` are readable and writable; an ecall from U
+  gives mcause 8.
+- `mie` and `mip` are readable.
+- **Exact 12-bit CSR decode.** Unknown CSRs read 0 and ignore writes. Upstream decodes the
+  address partially, so for example `mhartid` aliases another CSR.
+- `fence`, `fence.i` and `wfi` are no-ops. Upstream performs a real read for a fence and
+  traps on `wfi` as if it were `ebreak`.
+- **Zicbom.** `cbo.clean`, `cbo.flush` and `cbo.inval` leave as a byte read of rs1 marked by
+  `o_dbus_cmo` and `o_dbus_cmo_op` (00 inval, 01 clean, 10 flush), for the data cache to act
+  on. `cbo.zero` is a no-op.
+- `o_ibus_sel`: the fetch select without the reset gating of `o_ibus_cyc`, for address
+  multiplexers on a critical path.
+- Two fixes to upstream behaviour:
+  - A timer interrupt that lands on an `ecall` reported mcause `0x8000000F` instead of 7.
+  - An interrupt that lands on a CSR instruction writing `mstatus` or `mie` still performed
+    that write during the trap cycle. It could clear MIE before the trap saved it to MPIE, so
+    `mret` returned with interrupts off.
+
+## `SMODE=1` (with `LINUX=1`): S-mode for an SV32 kernel
+
+- U, S and M privilege levels and `sret`. Exceptions can be delegated (`medeleg`), and so can
+  the S timer and S external interrupts (`mideleg`).
+- S-mode CSRs: `sstatus` (with SUM and MXR), `sie`, `sip`, `stvec`, `sscratch`, `sepc`,
+  `scause`, `stval` and `satp`. `time`/`timeh` read an external `i_mtime`.
+- An S external interrupt input, `i_seip`, for a PLIC. The priority is MTI > SEI > STI.
+- Hooks for an MMU outside the core (`sv32_mmu.v` in the parent project):
+  - The core exports `o_priv`, `o_sum`, `o_mxr`, `o_satp_mode`, `o_satp_ppn`, `o_sfence` and
+    `o_xlate` (translation on, as a register rather than logic).
+  - It takes `i_ibus_fault`, `i_dbus_fault` and `i_dbus_fault_we`, and turns them into
+    instruction, load and store page faults.
+- `stvec`, `sscratch`, `sepc` and `stval` sit in the register-file RAM next to the M-mode
+  ones, so the RF has 4 more CSR slots.
+
+## Not implemented
+
+- Illegal-instruction traps.
+- The M external interrupt (MEIP).
+- `mstatus.MPRV`, `menvcfg`/`senvcfg`, and the `cycle`/`instret` counters.
+
+## Testing
+
+All the testing lives in the parent project, at both widths (`W=1` and `W=4`):
+
+- riscv-tests rv32ui, rv32um and rv32ua, plus rv32si with `SMODE=1`.
+- Directed tests that run in lockstep with a Python reference model (`verif/qerv/`).
+- Linux, booted on the board.
+
+The parent project's CLAUDE.md has the details, including a list of SERV quirks that
+matter for Linux.
+
+## License
+
+ISC, like upstream SERV.
+
+---
+
+*The rest of this file is upstream SERV's README.*
+
 <img align="right" src="https://svg.wavedrom.com/{signal:[{wave:'0.P...'},{wave:'023450',data:'S E R V'}]}"/>
 
 # SERV
