@@ -48,15 +48,18 @@ targets:
     toplevel : ["is_toplevel? (serv_rf_top)"]
 
   lint:
-    default_tool : verilator
     description: Run static code checks (linting)
     filesets : [core]
+    flow: lint
+    flow_options:
+      tool: verilator
+      verilator_options:
+        - "-Wall"
+    # The flow API does not set the tool flag that default_tool did; without it the core's
+    # "tool_verilator?" fileset entry, the lint waivers, drops out
+    flags:
+      tool: verilator
     parameters: [W]
-    tools:
-      verilator:
-        mode : lint-only
-        verilator_options:
-          - "-Wall"
     toplevel : serv_rf_top
 
   sky130:

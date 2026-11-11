@@ -17,10 +17,9 @@ targets:
     filesets : [rtl]
 
   lint:
-    default_tool : verilator
     description: Run static code checks (linting)
     filesets : [rtl]
-    tools:
-      verilator:
-        mode : lint-only
+    flow: lint
+    flow_options:
+      tool: verilator
     toplevel : serving
