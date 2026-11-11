@@ -82,6 +82,11 @@ module serv_top
       outside the core (an AMO unit) must perform the read-modify-write and reservation. */
    output wire 		      o_dbus_amo,
    output wire [4:0] 	      o_dbus_amo_op,
+   /* LINUX: Zicbom. cbo.inval/clean/flush look like a byte read of rs1 (o_dbus_we=0) with
+      o_dbus_cmo=1 and o_dbus_cmo_op = 00 inval, 01 clean, 10 flush. The data is not used;
+      the cache performs the operation on the block holding the address and acks. */
+   output wire 		      o_dbus_cmo,
+   output wire [1:0] 	      o_dbus_cmo_op,
    input wire [31:0] 	      i_dbus_rdt,
    input wire 		      i_dbus_ack,
    //Extension
@@ -360,6 +365,8 @@ module serv_top
       .o_mdu_op           (mdu_op),
       .o_amo              (o_dbus_amo),
       .o_amo_op           (o_dbus_amo_op),
+      .o_cmo              (o_dbus_cmo),
+      .o_cmo_op           (o_dbus_cmo_op),
       .o_two_stage_op     (two_stage_op),
       //Extension
       .o_ext_funct3       (o_ext_funct3),

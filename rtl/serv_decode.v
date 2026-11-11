@@ -11,7 +11,8 @@ module serv_decode
     /* LINUX=1 adds what an M-mode no-MMU Linux needs (see qerv-linux branch notes):
        A extension (AMO/LR/SC as one dbus transaction carrying funct5, executed outside the
        core), exact 12-bit CSR decode (unimplemented CSRs read 0, writes ignored), mip
-       readable, fence/fence.i/wfi as no-ops. LINUX=0 is bit-identical to upstream. */
+       readable, fence/fence.i/wfi as no-ops, and Zicbom (cbo.clean/flush/inval on the data
+       bus, see o_cmo). LINUX=0 is bit-identical to upstream. */
     parameter [0:0] LINUX = 0,
     /* SMODE=1 (with LINUX=1): exact decode of ecall/ebreak/mret/sret/sfence.vma, the S-mode
        CSRs (S group of the RF CSRs, o_csr_sel for the ones in serv_csr). */
@@ -37,6 +38,9 @@ module serv_decode
    //A extension (LINUX)
    output reg       o_amo,
    output reg [4:0] o_amo_op,
+   //Zicbom (LINUX)
+   output reg       o_cmo,
+   output reg [1:0] o_cmo_op,
    //Extension
    output reg [2:0] o_ext_funct3,
    //To bufreg
@@ -102,17 +106,26 @@ module serv_decode
    //MISC-MEM (fence, fence.i): opcode 0001111. Decoded as a one-stage no-op when LINUX=1
    //(upstream treats it as a data bus read that does not write rd)
    wire misc_mem  = LINUX & !opcode[4] & !opcode[3] & !opcode[2] & opcode[0];
+   //Zicbom: cbo.inval/clean/flush are MISC-MEM with funct3 010 and imm 0/1/2 (rd = 0). They go
+   //out as a byte read of rs1 (no immediate: the operation is in imm; a byte access never
+   //traps as misaligned) with o_cmo=1 and o_cmo_op = imm[1:0] (00 inval, 01 clean, 10 flush);
+   //rd is not written. Only imm[2:0] is decoded (this compare feeds the bus): cbo.zero (4,
+   //Zicboz) and imm[1:0] = 11 stay no-ops like fence; the reserved encodings with higher imm
+   //bits set act as the CMO named by imm[1:0].
+   wire co_cmo    = misc_mem & (funct3 == 3'b010) & !imm31_20[2] & !(&imm31_20[1:0]);
+   wire [1:0] co_cmo_op = imm31_20[1:0];
+   wire misc_nop  = misc_mem & !co_cmo;
 
    wire co_mdu_op     = MDU & (opcode == 5'b01100) & imm25;
 
    wire co_two_stage_op =
-	(~opcode[2] & !misc_mem) | (funct3[0] & ~funct3[1] & ~opcode[0] & ~opcode[4]) |
+	(~opcode[2] & !misc_nop) | (funct3[0] & ~funct3[1] & ~opcode[0] & ~opcode[4]) |
 	(funct3[1] & ~funct3[2] & ~opcode[0] & ~opcode[4]) | co_mdu_op;
    wire co_shift_op = (opcode[2] & ~funct3[1]) & !co_mdu_op;
    wire co_branch_op = opcode[4];
-   wire co_dbus_en    = ~opcode[2] & ~opcode[4] & !misc_mem;
+   wire co_dbus_en    = ~opcode[2] & ~opcode[4] & !misc_nop;
    wire co_mtval_pc   = opcode[4];
-   wire co_mem_word   = funct3[1];
+   wire co_mem_word   = funct3[1] & !misc_mem;   //a CMO is a byte access
    wire co_rd_alu_en  = !opcode[0] & opcode[2] & !opcode[4] & !co_mdu_op;
    wire co_rd_mem_en  = (!opcode[2] & !opcode[0]) | co_mdu_op | co_amo;
    wire [2:0] co_ext_funct3 = funct3;
@@ -122,8 +135,9 @@ module serv_decode
    //mem        = rs1+imm
    //shift      = rs1
    wire co_bufreg_rs1_en = !opcode[4] | (!opcode[1] & opcode[0]);
-   //AMO addresses are rs1 without an immediate
-   wire co_bufreg_imm_en = !opcode[2] & !co_amo;
+   //AMO and CMO addresses are rs1 without an immediate (misc_mem: fence and fence.i do not
+   //use the address, so the opcode alone is enough)
+   wire co_bufreg_imm_en = !opcode[2] & !co_amo & !misc_mem;
 
    //Clear LSB of immediate for BRANCH and JAL ops
    //True for BRANCH and JAL
@@ -285,9 +299,10 @@ module serv_decode
 
    wire [3:0] co_immdec_en;
    assign co_immdec_en[3] = opcode[4] | opcode[3] | opcode[2] | !opcode[0];                 //B I J S U
-   //AMO (R-type) keeps rs1/rs2 like OP; with W=1 these registers double as rs1/rs2 addresses
+   //AMO (R-type) keeps rs1/rs2 like OP; with W=1 these registers double as rs1/rs2 addresses.
+   //A CMO (MISC-MEM: opcode[2:1] = 01) has no immediate to shift and must keep rs1 too.
    assign co_immdec_en[2] = ((opcode[4] & opcode[2]) | !opcode[3] | opcode[0]) & !co_amo;    //  I J   U
-   assign co_immdec_en[1] = ((opcode[2:1] == 2'b01) | (opcode[2] & opcode[0]) | co_csr_imm_en) & !co_amo;//    J   U
+   assign co_immdec_en[1] = ((opcode[2:1] == 2'b01) | (opcode[2] & opcode[0]) | co_csr_imm_en) & !co_amo & !misc_mem;//    J   U
    assign co_immdec_en[0] = ~co_rd_op;                                                       //B     S
 
    wire [2:0] co_alu_rd_sel;
@@ -325,6 +340,8 @@ module serv_decode
             o_mdu_op           = co_mdu_op;
             o_amo              = co_amo;
             o_amo_op           = co_amo_op;
+            o_cmo              = co_cmo;
+            o_cmo_op           = co_cmo_op;
             o_ext_funct3       = co_ext_funct3;
             o_bufreg_rs1_en    = co_bufreg_rs1_en;
             o_bufreg_imm_en    = co_bufreg_imm_en;
@@ -388,6 +405,8 @@ module serv_decode
                o_mdu_op           <= co_mdu_op;
                o_amo              <= co_amo;
                o_amo_op           <= co_amo_op;
+               o_cmo              <= co_cmo;
+               o_cmo_op           <= co_cmo_op;
                o_ext_funct3       <= co_ext_funct3;
                o_bufreg_rs1_en    <= co_bufreg_rs1_en;
                o_bufreg_imm_en    <= co_bufreg_imm_en;

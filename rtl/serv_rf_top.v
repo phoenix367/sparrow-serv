@@ -81,6 +81,8 @@ module serv_rf_top
    output wire 	      o_dbus_cyc,
    output wire 	      o_dbus_amo,
    output wire [4:0]  o_dbus_amo_op,
+   output wire 	      o_dbus_cmo,
+   output wire [1:0]  o_dbus_cmo_op,
    input wire [31:0]  i_dbus_rdt,
    input wire 	      i_dbus_ack,
 
@@ -236,6 +238,8 @@ module serv_rf_top
       .o_dbus_cyc   (o_dbus_cyc),
       .o_dbus_amo   (o_dbus_amo),
       .o_dbus_amo_op(o_dbus_amo_op),
+      .o_dbus_cmo   (o_dbus_cmo),
+      .o_dbus_cmo_op(o_dbus_cmo_op),
       .i_dbus_rdt   (i_dbus_rdt),
       .i_dbus_ack   (i_dbus_ack),
 
